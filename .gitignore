@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Сборка приложения и релизные архивы
+/build/
+*.app
+*.zip
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Локальные заметки и планы
+PLAN.md
