@@ -4,9 +4,9 @@
   Lightweight, native macOS menu bar utility written in Rust that keeps your Desktop clean automatically without draining RAM or battery.
 </p>
 
-| Interface | Live Demo |
-| :---: | :---: |
-| ![Desktop Cleaner Interface](screenshot.png) | ![Desktop Cleaner Demo](demo.gif) |
+<p align="center">
+  <img src="screenshot.png" width="360" alt="Desktop Cleaner Interface">
+</p>
 
 ## Why Desktop Cleaner?
 
