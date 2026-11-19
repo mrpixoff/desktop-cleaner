@@ -6,6 +6,7 @@
 /build/
 *.app
 *.zip
+*.dmg
 
 # macOS
 .DS_Store

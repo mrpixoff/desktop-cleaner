@@ -14,6 +14,8 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 ICONSET_DIR="$ROOT_DIR/build/AppIcon.iconset"
 ICON_PNG="$ROOT_DIR/build/AppIcon-1024.png"
 ZIP_PATH="$ROOT_DIR/DesktopCleaner-macOS-AppleSilicon.zip"
+DMG_PATH="$ROOT_DIR/DesktopCleaner-macOS-AppleSilicon.dmg"
+DMG_STAGING_DIR="$ROOT_DIR/build/dmg"
 
 echo "==> cargo build --release"
 cargo build --release
@@ -163,5 +165,14 @@ echo "==> Упаковка релизного архива"
 rm -f "$ZIP_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
 
+echo "==> Сборка установочного образа"
+rm -rf "$DMG_STAGING_DIR"
+mkdir -p "$DMG_STAGING_DIR"
+ditto "$APP_DIR" "$DMG_STAGING_DIR/$APP_NAME.app"
+ln -s /Applications "$DMG_STAGING_DIR/Applications"
+rm -f "$DMG_PATH"
+hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
+
 echo "Готово: /Applications/$APP_NAME.app"
 echo "Архив для GitHub Releases: $ZIP_PATH"
+echo "Установочный образ: $DMG_PATH"

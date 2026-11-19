@@ -21,8 +21,8 @@ Most file organizers are heavy Electron apps that sit in your Dock and eat hundr
 
 ## Installation
 
-1. Go to the [Releases](../../releases) page and download `DesktopCleaner-macOS-AppleSilicon.zip`.
-2. Unzip the archive and move **Desktop Cleaner.app** to your `/Applications` folder.
+1. Go to the [Releases](../../releases) page and download `DesktopCleaner-macOS-AppleSilicon.dmg`.
+2. Open the disk image and drag **Desktop Cleaner.app** into your `/Applications` folder.
 3. Launch the app. On first run, macOS will ask for permission to access your Desktop folder—click **Allow**.
 
 *(Note: Since the app is self-signed, if macOS says the developer cannot be verified, right-click the app in Applications and select **Open**, or run `xattr -cr "/Applications/Desktop Cleaner.app"` in Terminal).*
