@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" width="128" height="128" alt="Desktop Cleaner icon">
+</p>
+
 <h1 align="center">Desktop Cleaner</h1>
 
 <p align="center">
