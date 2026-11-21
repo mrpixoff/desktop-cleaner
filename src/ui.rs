@@ -1,6 +1,8 @@
 //! Менюбар macOS и компактное окно настроек в стиле Vorssaint.
 
-use crate::config::{default_archive_dir, CleanMode, Config, Language, SortMode, Timer};
+use crate::config::{
+    default_archive_dir, sync_launch_agent, CleanMode, Config, Language, SortMode, Timer,
+};
 use crate::engine::run_cleanup_once;
 use crate::journal::undo_last_batch;
 use eframe::egui::{
@@ -37,6 +39,7 @@ struct Strings {
     auto_title: &'static str,
     auto_on: &'static str,
     auto_off: &'static str,
+    launch_at_login: &'static str,
     modes: [&'static str; MODE_COUNT],
     section_clean: &'static str,
     section_exceptions: &'static str,
@@ -89,6 +92,7 @@ const EN: Strings = Strings {
     auto_title: "AUTO-CLEANUP",
     auto_on: "Automatic cleanup: On",
     auto_off: "Automatic cleanup: Paused",
+    launch_at_login: "Launch at login & keep alive",
     modes: [
         "Clean everything (empty desktop)",
         "Screenshots only",
@@ -146,6 +150,7 @@ const RU: Strings = Strings {
     auto_title: "АВТООЧИСТКА",
     auto_on: "Автоматическая уборка: Вкл",
     auto_off: "Автоматическая уборка: Пауза",
+    launch_at_login: "Запускать при входе и держать в фоне",
     modes: [
         "Убрать всё (пустой стол)",
         "Убрать только скриншоты",
@@ -327,6 +332,7 @@ struct SettingsApp {
     desktop_dir: PathBuf,
     language: Language,
     enabled: bool,
+    launch_at_login: bool,
     mode_index: usize,
     formats_text: String,
     exceptions_text: String,
@@ -383,6 +389,7 @@ impl SettingsApp {
             desktop_dir,
             language: config.resolved_language(),
             enabled: config.enabled,
+            launch_at_login: config.launch_at_login,
             mode_index,
             formats_text,
             exceptions_text: config.exceptions.join("\n"),
@@ -440,6 +447,7 @@ impl SettingsApp {
 
         Ok(Config {
             enabled: self.enabled,
+            launch_at_login: self.launch_at_login,
             language: Some(self.language),
             mode,
             exceptions: split_list(&self.exceptions_text),
@@ -526,6 +534,50 @@ impl SettingsApp {
             }
             Err(err) => {
                 self.status = t.save_error(&err.to_string());
+                self.status_is_error = true;
+            }
+        }
+    }
+
+    fn set_launch_at_login(&mut self, enabled: bool) {
+        self.launch_at_login = enabled;
+        let t = strings(self.language);
+
+        let mut config = if self.config_path.exists() {
+            Config::load_from(&self.config_path)
+                .unwrap_or_else(|_| self.build_config().unwrap_or_default())
+        } else {
+            self.build_config().unwrap_or_default()
+        };
+        config.launch_at_login = enabled;
+
+        if let Err(err) = config.save_to(&self.config_path) {
+            self.status = t.save_error(&err.to_string());
+            self.status_is_error = true;
+            return;
+        }
+
+        match sync_launch_agent(enabled) {
+            Ok(()) => {
+                self.status = if enabled {
+                    if self.language == Language::Ru {
+                        "Фоновый режим при входе включён.".into()
+                    } else {
+                        "Launch at login enabled.".into()
+                    }
+                } else if self.language == Language::Ru {
+                    "Фоновый режим при входе выключен.".into()
+                } else {
+                    "Launch at login disabled.".into()
+                };
+                self.status_is_error = false;
+            }
+            Err(err) => {
+                self.status = if self.language == Language::Ru {
+                    format!("Не удалось обновить LaunchAgent: {err}")
+                } else {
+                    format!("Could not update LaunchAgent: {err}")
+                };
                 self.status_is_error = true;
             }
         }
@@ -725,9 +777,13 @@ impl eframe::App for SettingsApp {
                 ui.add_space(10.0);
 
                 let mut enabled = self.enabled;
-                auto_card(ui, &mut enabled, t);
+                let mut launch_at_login = self.launch_at_login;
+                auto_card(ui, &mut enabled, &mut launch_at_login, t);
                 if enabled != self.enabled {
                     self.toggle_enabled(enabled);
+                }
+                if launch_at_login != self.launch_at_login {
+                    self.set_launch_at_login(launch_at_login);
                 }
 
                 let footer_height = 150.0;
@@ -984,7 +1040,7 @@ fn language_switch(ui: &mut Ui, language: &mut Language) -> bool {
     changed
 }
 
-fn auto_card(ui: &mut Ui, enabled: &mut bool, t: &Strings) {
+fn auto_card(ui: &mut Ui, enabled: &mut bool, launch_at_login: &mut bool, t: &Strings) {
     egui::Frame::none()
         .fill(CARD)
         .stroke(Stroke::new(1.0_f32, BORDER))
@@ -1013,6 +1069,11 @@ fn auto_card(ui: &mut Ui, enabled: &mut bool, t: &Strings) {
                     |ui| big_toggle(ui, enabled),
                 );
             });
+
+            ui.add_space(10.0);
+            ui.add(egui::Separator::default().spacing(0.0));
+            ui.add_space(8.0);
+            toggle(ui, launch_at_login, t.launch_at_login);
         });
     ui.add_space(8.0);
 }

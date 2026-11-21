@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Имя файла конфигурации по умолчанию.
 pub const CONFIG_FILE: &str = "config.json";
@@ -59,6 +60,9 @@ pub struct Config {
     /// Автоматическая уборка включена (главный тумблер).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Запускать при входе в систему и держать агент живым.
+    #[serde(default = "default_true")]
+    pub launch_at_login: bool,
     /// Язык интерфейса (`None` — определить по языку системы).
     #[serde(default)]
     pub language: Option<Language>,
@@ -87,6 +91,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
+            launch_at_login: true,
             language: None,
             mode: CleanMode::Nothing,
             exceptions: Vec::new(),
@@ -168,6 +173,141 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
 }
 
+const LAUNCH_AGENT_LABEL: &str = "com.local.desktopcleaner";
+
+/// Путь к LaunchAgent plist в домашней библиотеке пользователя.
+pub fn launch_agent_plist_path() -> io::Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "нет домашней папки")
+    })?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCH_AGENT_LABEL}.plist")))
+}
+
+/// Путь к исполняемому файлу для LaunchAgent.
+pub fn launch_agent_program_path() -> PathBuf {
+    let installed = PathBuf::from("/Applications/Desktop Cleaner.app/Contents/MacOS/desktop_cleaner");
+    if installed.exists() {
+        return installed;
+    }
+    std::env::current_exe().unwrap_or(installed)
+}
+
+/// Синхронизирует LaunchAgent: записывает plist и включает/выключает агент.
+///
+/// `SuccessfulExit=false` в KeepAlive означает: macOS перезапускает процесс
+/// после падения/выгрузки, но не перезапускает после обычного exit(0)
+/// (например, когда пользователь нажал «Выход» в трее).
+pub fn sync_launch_agent(enabled: bool) -> io::Result<()> {
+    let plist_path = launch_agent_plist_path()?;
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let program = launch_agent_program_path();
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#,
+        label = LAUNCH_AGENT_LABEL,
+        program = xml_escape(&program.to_string_lossy()),
+    );
+    fs::write(&plist_path, plist)?;
+
+    let uid = current_uid()?;
+    let domain = format!("gui/{uid}");
+    let plist_str = plist_path.to_string_lossy().to_string();
+
+    if enabled {
+        // Не делаем bootout на удачном пути: если агент уже загружен, это
+        // может перезапустить текущий процесс. Bootstrap идемпотентно
+        // обновляем через bootout+bootstrap только при необходимости.
+        let bootstrapped = Command::new("launchctl")
+            .args(["bootstrap", &domain, &plist_str])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if bootstrapped {
+            return Ok(());
+        }
+
+        let _ = Command::new("launchctl")
+            .args(["bootout", &domain, &plist_str])
+            .status();
+        let _ = Command::new("launchctl")
+            .args(["unload", &plist_str])
+            .status();
+
+        let status = Command::new("launchctl")
+            .args(["bootstrap", &domain, &plist_str])
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            _ => {
+                let fallback = Command::new("launchctl")
+                    .args(["load", &plist_str])
+                    .status()?;
+                if fallback.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("не удалось включить LaunchAgent"))
+                }
+            }
+        }
+    } else {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &domain, &plist_str])
+            .status();
+        let _ = Command::new("launchctl")
+            .args(["unload", &plist_str])
+            .status();
+        Ok(())
+    }
+}
+
+fn current_uid() -> io::Result<String> {
+    let output = Command::new("id").arg("-u").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("не удалось получить uid"));
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uid.is_empty() {
+        return Err(io::Error::other("пустой uid"));
+    }
+    Ok(uid)
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +320,7 @@ mod tests {
         assert_eq!(config.timer, Timer::Immediate);
         assert_eq!(config.sort_mode, SortMode::ByDate);
         assert_eq!(config.language, None);
+        assert!(config.launch_at_login);
         assert!(config.exceptions.is_empty());
         assert_eq!(
             config.screenshot_prefixes,
@@ -198,6 +339,7 @@ mod tests {
 
         let config = Config {
             enabled: true,
+            launch_at_login: false,
             language: Some(Language::Ru),
             mode: CleanMode::SelectedFormats(vec!["pdf".into(), "png".into()]),
             exceptions: vec!["important.docx".into()],
@@ -227,10 +369,12 @@ mod tests {
         object.remove("enabled");
         object.remove("auto_delete_days");
         object.remove("language");
+        object.remove("launch_at_login");
         fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 
         let loaded = Config::load_from(&path).expect("load");
         assert!(loaded.enabled);
+        assert!(loaded.launch_at_login);
         assert_eq!(loaded.auto_delete_days, None);
         assert_eq!(loaded.language, None);
     }

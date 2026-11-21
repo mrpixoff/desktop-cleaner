@@ -94,9 +94,12 @@ pub fn start_watcher(
             Ok(_) => {
                 // Настройки могли измениться в окне настроек — читаем заново.
                 config = reload_config(&config_path, &config);
-                if config.enabled {
+                // В режимах Minutes/Daily события файловой системы не должны
+                // запускать уборку — там работает только периодический тикер.
+                if config.enabled && matches!(config.timer, Timer::Immediate) {
                     last_event = Some(Instant::now());
                 }
+                drain_events(&receiver);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -204,16 +207,9 @@ fn run_cleanup_filtered(
         }
 
         if let Some(min_age) = min_age {
-            match entry.metadata().and_then(|metadata| metadata.modified()) {
-                Ok(modified) => {
-                    let age = SystemTime::now()
-                        .duration_since(modified)
-                        .unwrap_or(Duration::ZERO);
-                    if age < min_age {
-                        continue;
-                    }
-                }
-                Err(_) => continue,
+            match file_age(&entry) {
+                Some(age) if age >= min_age => {}
+                _ => continue,
             }
         }
 
@@ -281,6 +277,29 @@ fn save_moved(
 
 fn reload_config(config_path: &Path, fallback: &Config) -> Config {
     Config::load_from(config_path).unwrap_or_else(|_| fallback.clone())
+}
+
+/// Возвращает возраст файла по самой свежей из доступных меток времени.
+///
+/// Берутся `modified` и `created`. Если метаданных нет, время недоступно
+/// или находится в будущем (часы ушли назад/сломанная метка) — возвращается
+/// `None`, и такой файл не трогаем.
+fn file_age(entry: &fs::DirEntry) -> Option<Duration> {
+    let metadata = entry.metadata().ok()?;
+    let mut newest: Option<SystemTime> = None;
+
+    for candidate in [metadata.modified().ok(), metadata.created().ok()] {
+        let Some(time) = candidate else {
+            continue;
+        };
+        newest = Some(match newest {
+            Some(current) if current >= time => current,
+            _ => time,
+        });
+    }
+
+    let newest = newest?;
+    SystemTime::now().duration_since(newest).ok()
 }
 
 /// Отправляет устаревшие объекты архива в Корзину, если включено автоудаление.
@@ -459,5 +478,67 @@ mod tests {
         assert_eq!(count, 0);
         assert!(desktop.join(".DS_Store").exists());
         assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn minutes_timer_moves_only_files_older_than_threshold() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let desktop = root.path().join("Desktop");
+        let archive = root.path().join("Archive");
+        let journal_path = root.path().join("journal.json");
+
+        let fresh = desktop.join("fresh.txt");
+        let old = desktop.join("old.txt");
+        write(&fresh, "fresh");
+        write(&old, "old");
+
+        // Явно задаём обе метки (created/modified), чтобы тест не зависел
+        // от времени рождения файла в файловой системе.
+        set_file_age(&fresh, Duration::from_secs(10));
+        set_file_age(&old, Duration::from_secs(121 * 60));
+
+        let cfg = config(archive.clone(), CleanMode::OnlyFolders);
+        let count = run_cleanup_filtered(
+            &desktop,
+            &cfg,
+            &journal_path,
+            Some(Duration::from_secs(120 * 60)),
+        )
+        .expect("cleanup");
+
+        assert_eq!(count, 1);
+        assert!(
+            fresh.exists(),
+            "файл возрастом 10 секунд не должен убираться при Timer::Minutes(120)"
+        );
+        assert!(
+            !old.exists(),
+            "файл старше 120 минут должен быть перенесён"
+        );
+        assert!(archive.join("Documents").join("old.txt").exists());
+    }
+
+    fn set_file_age(path: &Path, age: Duration) {
+        let target = SystemTime::now() - age;
+
+        // Надёжнее всего выставить обе метки времени явным вызовом SetFile,
+        // чтобы проверка "самая свежая из modified/created" была детерминированной.
+        #[cfg(target_os = "macos")]
+        {
+            let dt: chrono::DateTime<Local> = target.into();
+            let formatted = dt.format("%m/%d/%Y %H:%M:%S").to_string();
+            let status = std::process::Command::new("SetFile")
+                .args(["-d", &formatted, "-m", &formatted])
+                .arg(path)
+                .status()
+                .expect("SetFile должен быть доступен в macOS");
+            assert!(status.success(), "SetFile не смог выставить время файла");
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let file = fs::OpenOptions::new().write(true).open(path).expect("open file");
+            file.set_modified(target).expect("set modified");
+        }
     }
 }
