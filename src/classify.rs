@@ -32,6 +32,11 @@ pub fn should_archive(path: &Path, config: &Config) -> bool {
         return false;
     }
 
+    // Недокачанные браузерные загрузки никогда не переносим.
+    if is_incomplete_download(path) {
+        return false;
+    }
+
     // Исключения пользователя имеют приоритет над любым режимом.
     if config
         .exceptions
@@ -71,6 +76,18 @@ pub fn should_archive(path: &Path, config: &Config) -> bool {
 /// Скрытые (начинающиеся с точки) и служебные файлы macOS.
 fn is_hidden_system_file(name: &str) -> bool {
     name.starts_with('.') || name == ".DS_Store" || name == ".localized"
+}
+
+/// Временные файлы незавершённых загрузок браузеров.
+fn is_incomplete_download(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "crdownload" | "download" | "part" | "tmp"
+    )
 }
 
 #[cfg(test)]
@@ -166,6 +183,29 @@ mod tests {
         let dotted = config(CleanMode::SelectedFormats(vec![".md".into()]));
         assert!(should_archive(Path::new("README.md"), &dotted));
         assert!(!should_archive(Path::new("README.txt"), &dotted));
+    }
+
+    #[test]
+    fn incomplete_browser_downloads_are_never_archived() {
+        let cfg = config(CleanMode::Nothing);
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let crdownload = dir.path().join("big-file.zip.crdownload");
+        let download = dir.path().join("big-file.zip.download");
+        let part = dir.path().join("big-file.zip.part");
+        let tmp = dir.path().join("big-file.TMP");
+        for path in [&crdownload, &download, &part, &tmp] {
+            std::fs::write(path, b"x").expect("create file");
+        }
+
+        assert!(!should_archive(&crdownload, &cfg));
+        assert!(!should_archive(&download, &cfg));
+        assert!(!should_archive(&part, &cfg));
+        assert!(!should_archive(&tmp, &cfg));
+
+        let finished = dir.path().join("big-file.zip");
+        std::fs::write(&finished, b"x").expect("create file");
+        assert!(should_archive(&finished, &cfg));
     }
 
     #[test]

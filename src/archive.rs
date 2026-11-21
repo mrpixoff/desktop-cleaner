@@ -188,7 +188,10 @@ pub(crate) fn move_path(src: &Path, destination: &Path) -> io::Result<()> {
     match fs::rename(src, destination) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
-            copy_recursive(src, destination)?;
+            if let Err(copy_err) = copy_recursive(src, destination) {
+                let _ = remove_path(destination);
+                return Err(copy_err);
+            }
             remove_path(src)
         }
         Err(err) => Err(err),
@@ -204,8 +207,37 @@ fn copy_recursive(src: &Path, destination: &Path) -> io::Result<()> {
         }
         Ok(())
     } else {
-        fs::copy(src, destination).map(|_| ())
+        copy_file_verified(src, destination)
     }
+}
+
+fn copy_file_verified(src: &Path, destination: &Path) -> io::Result<()> {
+    let src_size = fs::metadata(src)?.len();
+    let copied = match fs::copy(src, destination) {
+        Ok(copied) => copied,
+        Err(err) => {
+            let _ = fs::remove_file(destination);
+            return Err(err);
+        }
+    };
+
+    let dst_size = match fs::metadata(destination) {
+        Ok(metadata) => metadata.len(),
+        Err(err) => {
+            let _ = fs::remove_file(destination);
+            return Err(err);
+        }
+    };
+
+    if copied != src_size || dst_size != src_size {
+        let _ = fs::remove_file(destination);
+        return Err(io::Error::other(format!(
+            "размер копии не совпадает с оригиналом: {} (src={src_size}, copied={copied}, dst={dst_size})",
+            src.display()
+        )));
+    }
+
+    Ok(())
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
@@ -350,6 +382,47 @@ mod tests {
             fs::read_to_string(destination.join("assets").join("logo.png")).unwrap(),
             "png"
         );
+    }
+
+    #[test]
+    fn cross_device_file_copy_is_verified_before_removing_source() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let src = root.path().join("source.bin");
+        let dst = root.path().join("nested").join("dest.bin");
+        let contents = vec![42u8; 1024 * 16];
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&src, &contents).expect("write src");
+
+        copy_file_verified(&src, &dst).expect("copy should succeed");
+
+        let src_meta = fs::metadata(&src).expect("src metadata");
+        let dst_meta = fs::metadata(&dst).expect("dst metadata");
+        assert_eq!(src_meta.len(), dst_meta.len());
+        assert_eq!(fs::read(&dst).unwrap(), contents);
+        assert!(
+            src.exists(),
+            "источник должен оставаться на месте до явного удаления после успешной проверки"
+        );
+
+        // Имитируем ветку EXDEV: удаляем исходник только после успешной проверки копии.
+        fs::remove_file(&src).expect("remove src");
+        assert!(!src.exists());
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn cross_device_copy_failure_keeps_source_intact() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let src = root.path().join("source.txt");
+        write(&src, "important");
+        let dst_dir = root.path().join("dst_as_dir");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        let err = copy_file_verified(&src, &dst_dir).expect_err("copy into directory must fail");
+
+        assert!(src.exists(), "исходник нельзя удалять при неуспешной копии");
+        assert_eq!(fs::read_to_string(&src).unwrap(), "important");
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
