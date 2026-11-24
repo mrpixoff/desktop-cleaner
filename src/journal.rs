@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Имя файла журнала по умолчанию.
 pub const JOURNAL_FILE: &str = "journal.json";
@@ -59,14 +60,33 @@ impl Journal {
     }
 
     /// Сохранить журнал в произвольный путь.
+    ///
+    /// Запись атомарная, чтобы падение процесса не оставило битый journal.json.
     pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(|err| {
             io::Error::new(io::ErrorKind::InvalidData, err)
         })?;
-        if let Some(parent) = path.as_ref().parent() {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, json)
+
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "journal".to_string());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+
+        fs::write(&tmp, json)?;
+        if let Err(err) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Добавить новую пачку с текущей отметкой времени.

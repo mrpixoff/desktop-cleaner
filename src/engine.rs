@@ -26,6 +26,8 @@ const POLL_TICK: Duration = Duration::from_millis(200);
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Как часто проверять срок хранения архива, если автоудаление включено.
 const ARCHIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Пауза между итерациями, после которой считаем, что Mac выходил из сна.
+const WAKE_GAP: Duration = Duration::from_secs(30);
 
 /// Один проход уборки верхнего уровня `desktop_dir`.
 ///
@@ -87,9 +89,43 @@ pub fn start_watcher(
     let mut last_event: Option<Instant> = None;
     let mut last_poll = Instant::now();
     let mut last_config_refresh = Instant::now();
-    let mut last_daily_key: Option<String> = None;
+    let mut last_daily_date: Option<String> = None;
+    let mut last_wall = SystemTime::now();
 
     while !stop_signal.load(Ordering::Relaxed) {
+        // `Instant` на macOS может «замирать» во время сна, а `SystemTime`
+        // продолжает идти. Большой разрыв означает пробуждение — после него
+        // нужно сразу проверить Рабочий стол, не дожидаясь событий FSEvents.
+        let now_wall = SystemTime::now();
+        let woke_from_sleep = long_gap_since(last_wall, now_wall);
+        last_wall = now_wall;
+
+        if woke_from_sleep {
+            config = reload_config(&config_path, &config);
+            if config.enabled {
+                match config.timer.clone() {
+                    Timer::Immediate => last_event = Some(Instant::now()),
+                    Timer::Minutes(minutes) => {
+                        let min_age = Duration::from_secs(minutes.saturating_mul(60));
+                        if let Err(err) = run_cleanup_filtered(
+                            &desktop_dir,
+                            &config,
+                            &journal_path,
+                            Some(min_age),
+                        ) {
+                            eprintln!("desktop_cleaner: уборка после сна не удалась: {err}");
+                        }
+                        cleanup_archive_if_due(&config, &mut last_archive_cleanup, true);
+                        last_poll = Instant::now();
+                    }
+                    Timer::Daily(_) => {
+                        // Дадим ветке Daily сразу выполнить догоняющую проверку.
+                        last_poll = Instant::now() - DAILY_POLL_INTERVAL;
+                    }
+                }
+            }
+        }
+
         match receiver.recv_timeout(POLL_TICK) {
             Ok(_) => {
                 // Настройки могли измениться в окне настроек — читаем заново.
@@ -173,11 +209,13 @@ pub fn start_watcher(
 
                     if let Timer::Daily(schedule) = &config.timer {
                         let now = Local::now();
-                        let minute_key = now.format("%Y-%m-%d %H:%M").to_string();
-                        let is_time = now.format("%H:%M").to_string() == *schedule;
+                        let today = now.format("%Y-%m-%d").to_string();
 
-                        if is_time && last_daily_key.as_deref() != Some(minute_key.as_str()) {
-                            last_daily_key = Some(minute_key);
+                        // «Догоняем» расписание, если Mac спал или приложение
+                        // запустилось позже указанного времени. Один проход
+                        // в сутки, без пропусков из-за сна/блокировки экрана.
+                        if daily_due(now, schedule, last_daily_date.as_deref()) {
+                            last_daily_date = Some(today);
                             run_and_log(&desktop_dir, &config, &journal_path);
                             cleanup_archive_if_due(&config, &mut last_archive_cleanup, true);
                         }
@@ -195,12 +233,31 @@ fn run_cleanup_filtered(
     journal_path: &Path,
     min_age: Option<Duration>,
 ) -> io::Result<usize> {
+    if same_directory(desktop_dir, &config.archive_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "папка архива не должна совпадать с Рабочим столом",
+        ));
+    }
+
+    let archive_identity = fs::canonicalize(&config.archive_dir).ok();
     let mut journal = Journal::load_from(journal_path)?;
     let mut moved: Vec<MovedItem> = Vec::new();
 
     for entry in fs::read_dir(desktop_dir)? {
         let entry = entry?;
         let path = entry.path();
+
+        // Архив может лежать прямо на Рабочем столе — его нельзя переносить
+        // в самого себя.
+        if path == config.archive_dir
+            || (path.is_dir()
+                && archive_identity
+                    .as_ref()
+                    .is_some_and(|archive| fs::canonicalize(&path).ok().as_ref() == Some(archive)))
+        {
+            continue;
+        }
 
         if !should_archive(&path, config) {
             continue;
@@ -252,12 +309,16 @@ fn is_real_desktop(desktop_dir: &Path) -> bool {
         return false;
     };
 
-    if real_desktop == desktop_dir {
+    same_directory(&real_desktop, desktop_dir)
+}
+
+fn same_directory(a: &Path, b: &Path) -> bool {
+    if a == b {
         return true;
     }
 
-    match (fs::canonicalize(&real_desktop), fs::canonicalize(desktop_dir)) {
-        (Ok(real), Ok(current)) => real == current,
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
 }
@@ -339,6 +400,30 @@ fn drain_events(receiver: &Receiver<notify::Result<notify::Event>>) {
     while receiver.try_recv().is_ok() {}
 }
 
+/// Пора ли выполнять ежедневную уборку.
+///
+/// Сравниваем не минуту, а дату: если Mac спал в 03:00 и проснулся в 09:00,
+/// уборка всё равно выполнится один раз за эти сутки.
+fn daily_due(
+    now: chrono::DateTime<Local>,
+    schedule: &str,
+    last_run_date: Option<&str>,
+) -> bool {
+    let Ok(scheduled) = chrono::NaiveTime::parse_from_str(schedule, "%H:%M") else {
+        return false;
+    };
+
+    let today = now.format("%Y-%m-%d").to_string();
+    now.time() >= scheduled && last_run_date != Some(today.as_str())
+}
+
+/// Определяет выход из сна по разрыву в настенных часах.
+fn long_gap_since(last: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(last)
+        .map(|gap| gap >= WAKE_GAP)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +443,40 @@ mod tests {
             sort_mode: SortMode::ByCategory,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn archive_folder_inside_desktop_is_never_moved_into_itself() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let desktop = root.path().join("Desktop");
+        let archive = desktop.join("Archive");
+        let journal_path = root.path().join("journal.json");
+
+        write(&desktop.join("note.txt"), "note");
+        write(&archive.join("Images").join("old.png"), "png");
+
+        let cfg = config(archive.clone(), CleanMode::Nothing);
+        let count = run_cleanup_once(&desktop, &cfg, &journal_path).expect("cleanup");
+
+        assert_eq!(count, 1, "должен убраться только файл, не папка архива");
+        assert!(archive.join("Images").join("old.png").exists());
+        assert!(desktop.join("Archive").exists());
+        assert!(archive.join("Documents").join("note.txt").exists());
+    }
+
+    #[test]
+    fn archive_must_not_equal_desktop() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let desktop = root.path().join("Desktop");
+        let journal_path = root.path().join("journal.json");
+        write(&desktop.join("note.txt"), "note");
+
+        let cfg = config(desktop.clone(), CleanMode::Nothing);
+        let err = run_cleanup_once(&desktop, &cfg, &journal_path)
+            .expect_err("архив не может совпадать с Рабочим столом");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(desktop.join("note.txt").exists());
     }
 
     #[test]
@@ -540,5 +659,45 @@ mod tests {
             let file = fs::OpenOptions::new().write(true).open(path).expect("open file");
             file.set_modified(target).expect("set modified");
         }
+    }
+
+    #[test]
+    fn daily_schedule_catches_up_after_sleep_and_runs_once_per_day() {
+        use chrono::TimeZone;
+
+        fn at(hour: u32, minute: u32) -> chrono::DateTime<Local> {
+            use chrono::TimeZone;
+            Local
+                .with_ymd_and_hms(2026, 5, 10, hour, minute, 0)
+                .single()
+                .expect("valid local time")
+        }
+
+        assert!(!daily_due(at(2, 59), "03:00", None));
+        assert!(daily_due(at(3, 0), "03:00", None));
+        assert!(
+            daily_due(at(9, 15), "03:00", None),
+            "после сна уборка должна догнать расписание"
+        );
+        assert!(!daily_due(at(9, 16), "03:00", Some("2026-05-10")));
+
+        let next_day = Local
+            .with_ymd_and_hms(2026, 5, 11, 3, 0, 0)
+            .single()
+            .unwrap();
+        assert!(daily_due(next_day, "03:00", Some("2026-05-10")));
+        assert!(!daily_due(at(9, 0), "not-a-time", None));
+    }
+
+    #[test]
+    fn large_wall_clock_gap_is_treated_as_wake() {
+        let start = SystemTime::now();
+
+        assert!(!long_gap_since(start, start + Duration::from_secs(5)));
+        assert!(long_gap_since(start, start + Duration::from_secs(31)));
+        assert!(!long_gap_since(
+            start + Duration::from_secs(60),
+            start
+        ));
     }
 }

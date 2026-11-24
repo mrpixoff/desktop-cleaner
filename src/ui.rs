@@ -1,7 +1,8 @@
 //! Менюбар macOS и компактное окно настроек в стиле Vorssaint.
 
 use crate::config::{
-    default_archive_dir, sync_launch_agent, CleanMode, Config, Language, SortMode, Timer,
+    default_archive_dir, launch_agent_status, sync_launch_agent, CleanMode, Config, Language,
+    SortMode, Timer,
 };
 use crate::engine::run_cleanup_once;
 use crate::journal::undo_last_batch;
@@ -16,7 +17,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::StartCause;
@@ -92,7 +95,7 @@ const EN: Strings = Strings {
     auto_title: "AUTO-CLEANUP",
     auto_on: "Automatic cleanup: On",
     auto_off: "Automatic cleanup: Paused",
-    launch_at_login: "Launch at login & keep alive",
+    launch_at_login: "Launch at Login",
     modes: [
         "Clean everything (empty desktop)",
         "Screenshots only",
@@ -150,7 +153,7 @@ const RU: Strings = Strings {
     auto_title: "АВТООЧИСТКА",
     auto_on: "Автоматическая уборка: Вкл",
     auto_off: "Автоматическая уборка: Пауза",
-    launch_at_login: "Запускать при входе и держать в фоне",
+    launch_at_login: "Запускать при входе в систему",
     modes: [
         "Убрать всё (пустой стол)",
         "Убрать только скриншоты",
@@ -389,7 +392,8 @@ impl SettingsApp {
             desktop_dir,
             language: config.resolved_language(),
             enabled: config.enabled,
-            launch_at_login: config.launch_at_login,
+            // Показываем реальное состояние системы, а не только запись в конфиге.
+            launch_at_login: launch_agent_status().unwrap_or(config.launch_at_login),
             mode_index,
             formats_text,
             exceptions_text: config.exceptions.join("\n"),
@@ -540,43 +544,40 @@ impl SettingsApp {
     }
 
     fn set_launch_at_login(&mut self, enabled: bool) {
-        self.launch_at_login = enabled;
         let t = strings(self.language);
-
-        let mut config = if self.config_path.exists() {
-            Config::load_from(&self.config_path)
-                .unwrap_or_else(|_| self.build_config().unwrap_or_default())
-        } else {
-            self.build_config().unwrap_or_default()
-        };
-        config.launch_at_login = enabled;
-
-        if let Err(err) = config.save_to(&self.config_path) {
-            self.status = t.save_error(&err.to_string());
-            self.status_is_error = true;
-            return;
-        }
 
         match sync_launch_agent(enabled) {
             Ok(()) => {
-                self.status = if enabled {
-                    if self.language == Language::Ru {
-                        "Фоновый режим при входе включён.".into()
-                    } else {
-                        "Launch at login enabled.".into()
-                    }
-                } else if self.language == Language::Ru {
-                    "Фоновый режим при входе выключен.".into()
+                let actual = launch_agent_status().unwrap_or(enabled);
+                self.launch_at_login = actual;
+
+                let mut config = if self.config_path.exists() {
+                    Config::load_from(&self.config_path)
+                        .unwrap_or_else(|_| self.build_config().unwrap_or_default())
                 } else {
-                    "Launch at login disabled.".into()
+                    self.build_config().unwrap_or_default()
+                };
+                config.launch_at_login = actual;
+
+                if let Err(err) = config.save_to(&self.config_path) {
+                    self.status = t.save_error(&err.to_string());
+                    self.status_is_error = true;
+                    return;
+                }
+
+                self.status = match (actual, self.language) {
+                    (true, Language::Ru) => "Автозапуск при входе включён.".into(),
+                    (true, Language::En) => "Launch at login enabled.".into(),
+                    (false, Language::Ru) => "Автозапуск при входе выключен.".into(),
+                    (false, Language::En) => "Launch at login disabled.".into(),
                 };
                 self.status_is_error = false;
             }
             Err(err) => {
-                self.status = if self.language == Language::Ru {
-                    format!("Не удалось обновить LaunchAgent: {err}")
-                } else {
-                    format!("Could not update LaunchAgent: {err}")
+                self.launch_at_login = launch_agent_status().unwrap_or(!enabled);
+                self.status = match self.language {
+                    Language::Ru => format!("Не удалось обновить автозапуск: {err}"),
+                    Language::En => format!("Could not update launch at login: {err}"),
                 };
                 self.status_is_error = true;
             }
@@ -1272,16 +1273,19 @@ struct TrayApp {
     stop_signal: Arc<AtomicBool>,
     tray: Option<TrayIcon>,
     enabled_item: Option<MenuItem>,
+    launch_item: Option<CheckMenuItem>,
     settings_item: Option<MenuItem>,
     cleanup_item: Option<MenuItem>,
     undo_item: Option<MenuItem>,
     quit_item: Option<MenuItem>,
     enabled_id: Option<MenuId>,
+    launch_id: Option<MenuId>,
     settings_id: Option<MenuId>,
     cleanup_id: Option<MenuId>,
     undo_id: Option<MenuId>,
     quit_id: Option<MenuId>,
     last_enabled_sync: Instant,
+    last_launch_sync: Instant,
     exit: bool,
 }
 
@@ -1305,16 +1309,19 @@ pub fn run_tray(
         stop_signal,
         tray: None,
         enabled_item: None,
+        launch_item: None,
         settings_item: None,
         cleanup_item: None,
         undo_item: None,
         quit_item: None,
         enabled_id: None,
+        launch_id: None,
         settings_id: None,
         cleanup_id: None,
         undo_id: None,
         quit_id: None,
         last_enabled_sync: Instant::now(),
+        last_launch_sync: Instant::now(),
         exit: false,
     };
 
@@ -1333,6 +1340,8 @@ impl TrayApp {
                 self.tray = Some(handles.tray);
                 self.enabled_id = Some(handles.enabled_id);
                 self.enabled_item = Some(handles.enabled_item);
+                self.launch_id = Some(handles.launch_id);
+                self.launch_item = Some(handles.launch_item);
                 self.settings_item = Some(handles.settings_item);
                 self.cleanup_item = Some(handles.cleanup_item);
                 self.undo_item = Some(handles.undo_item);
@@ -1346,6 +1355,59 @@ impl TrayApp {
                 eprintln!("desktop_cleaner: не удалось создать иконку менюбара: {err}");
                 self.exit = true;
             }
+        }
+    }
+
+    /// Переключает автозапуск из меню трея.
+    fn toggle_launch_at_login(&mut self) {
+        if !self.config_path.exists() {
+            if let Err(err) = spawn_settings_window() {
+                eprintln!("desktop_cleaner: не удалось открыть настройки: {err}");
+            }
+            return;
+        }
+
+        let enabled = self
+            .launch_item
+            .as_ref()
+            .map(|item| item.is_checked())
+            .unwrap_or(false);
+
+        match sync_launch_agent(enabled) {
+            Ok(()) => {
+                let actual = launch_agent_status().unwrap_or(enabled);
+                let mut config = match Config::load_from(&self.config_path) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        eprintln!("desktop_cleaner: не удалось прочитать настройки: {err}");
+                        self.sync_launch_check();
+                        return;
+                    }
+                };
+                config.launch_at_login = actual;
+                if let Err(err) = config.save_to(&self.config_path) {
+                    eprintln!("desktop_cleaner: не удалось сохранить настройки: {err}");
+                }
+            }
+            Err(err) => {
+                eprintln!("desktop_cleaner: не удалось изменить автозапуск: {err}");
+            }
+        }
+
+        self.sync_launch_check();
+        self.last_launch_sync = Instant::now();
+    }
+
+    /// Приводит галочку в меню к реальному состоянию launchd.
+    fn sync_launch_check(&self) {
+        let Some(item) = &self.launch_item else {
+            return;
+        };
+        let Some(actual) = launch_agent_status() else {
+            return;
+        };
+        if item.is_checked() != actual {
+            item.set_checked(actual);
         }
     }
 
@@ -1385,6 +1447,11 @@ impl TrayApp {
             &self.enabled_item,
             if config.enabled { t.pause } else { t.enable_auto },
         );
+        if let Some(item) = &self.launch_item {
+            if item.text() != t.launch_at_login {
+                item.set_text(t.launch_at_login);
+            }
+        }
         set_item_text(&self.settings_item, t.settings);
         set_item_text(&self.cleanup_item, t.clean_now);
         set_item_text(&self.undo_item, t.undo);
@@ -1394,6 +1461,8 @@ impl TrayApp {
     fn handle_menu(&mut self, id: &MenuId) {
         if self.enabled_id.as_ref() == Some(id) {
             self.toggle_enabled();
+        } else if self.launch_id.as_ref() == Some(id) {
+            self.toggle_launch_at_login();
         } else if self.settings_id.as_ref() == Some(id) {
             if let Err(err) = spawn_settings_window() {
                 eprintln!("desktop_cleaner: не удалось открыть настройки: {err}");
@@ -1466,6 +1535,11 @@ impl ApplicationHandler<TrayUserEvent> for TrayApp {
             self.sync_labels();
         }
 
+        if self.last_launch_sync.elapsed() >= Duration::from_secs(10) {
+            self.last_launch_sync = Instant::now();
+            self.sync_launch_check();
+        }
+
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             Instant::now() + Duration::from_millis(500),
         ));
@@ -1475,11 +1549,13 @@ impl ApplicationHandler<TrayUserEvent> for TrayApp {
 struct TrayHandles {
     tray: TrayIcon,
     enabled_item: MenuItem,
+    launch_item: CheckMenuItem,
     settings_item: MenuItem,
     cleanup_item: MenuItem,
     undo_item: MenuItem,
     quit_item: MenuItem,
     enabled_id: MenuId,
+    launch_id: MenuId,
     settings_id: MenuId,
     cleanup_id: MenuId,
     undo_id: MenuId,
@@ -1502,12 +1578,16 @@ fn build_tray(config: &Config) -> Result<TrayHandles, Box<dyn Error>> {
         true,
         None,
     );
+    let launch_enabled = launch_agent_status().unwrap_or(config.launch_at_login);
+    let launch = CheckMenuItem::new(t.launch_at_login, true, launch_enabled, None);
     let settings = MenuItem::new(t.settings, true, None);
     let cleanup = MenuItem::new(t.clean_now, true, None);
     let undo = MenuItem::new(t.undo, true, None);
     let quit = MenuItem::new(t.quit, true, None);
 
     menu.append(&auto)?;
+    menu.append(&launch)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&settings)?;
     menu.append(&cleanup)?;
     menu.append(&undo)?;
@@ -1527,6 +1607,8 @@ fn build_tray(config: &Config) -> Result<TrayHandles, Box<dyn Error>> {
         tray,
         enabled_id: auto.id().clone(),
         enabled_item: auto,
+        launch_id: launch.id().clone(),
+        launch_item: launch,
         settings_item: settings.clone(),
         cleanup_item: cleanup.clone(),
         undo_item: undo.clone(),

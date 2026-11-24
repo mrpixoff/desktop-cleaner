@@ -44,6 +44,21 @@ pub fn move_to_archive(src: &Path, config: &Config) -> io::Result<PathBuf> {
     };
     fs::create_dir_all(&destination_dir)?;
 
+    // Защита от переноса папки в саму себя (например, архив выбран внутри
+    // переносимой папки).
+    if src.is_dir() {
+        if let (Ok(src_canon), Ok(dest_canon)) =
+            (fs::canonicalize(src), fs::canonicalize(&destination_dir))
+        {
+            if dest_canon.starts_with(&src_canon) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("нельзя переместить папку внутрь самой себя: {}", src.display()),
+                ));
+            }
+        }
+    }
+
     let destination = unique_destination(&destination_dir, file_name, src.is_dir());
     move_path(src, &destination)?;
 
@@ -119,7 +134,9 @@ fn is_category_dir(name: &str) -> bool {
 }
 
 fn is_expired(path: &Path, cutoff: SystemTime) -> io::Result<bool> {
-    let modified = fs::metadata(path)?.modified()?;
+    // `symlink_metadata` не идёт по ссылке: битая символическая ссылка
+    // в архиве не должна ломать всю очистку.
+    let modified = fs::symlink_metadata(path)?.modified()?;
     Ok(modified < cutoff)
 }
 
@@ -423,6 +440,26 @@ mod tests {
         assert!(src.exists(), "исходник нельзя удалять при неуспешной копии");
         assert_eq!(fs::read_to_string(&src).unwrap(), "important");
         assert!(!err.to_string().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_archive_survives_broken_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let archive = root.path().join("archive");
+        let images = archive.join("Images");
+        fs::create_dir_all(&images).unwrap();
+        symlink(archive.join("missing-target"), images.join("broken.png")).unwrap();
+
+        let removed = cleanup_expired_archive_with(&archive, 7, |path| {
+            fs::remove_file(path)
+        })
+        .expect("битая ссылка не должна ломать очистку");
+
+        assert_eq!(removed, 0);
+        assert!(images.join("broken.png").symlink_metadata().is_ok());
     }
 
     #[test]

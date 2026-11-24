@@ -4,7 +4,7 @@
 use desktop_cleaner::engine::start_watcher;
 use desktop_cleaner::ui;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,25 +33,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "нет домашней папки"))?;
 
     // Дочерний процесс: только окно настроек, без менюбара.
-    if std::env::args().skip(1).any(|arg| arg == "--settings") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--settings") {
         ui::run_settings_window(config_path, journal_path, desktop_dir)?;
         return Ok(());
     }
+    let background = args.iter().any(|arg| arg == "--background");
 
     // Single instance: если фоновый процесс уже жив, не запускаем второй watcher.
-    if another_instance_running(&pid_path) {
-        if let Err(err) = ui::spawn_settings_window() {
-            eprintln!("desktop_cleaner: не удалось открыть настройки: {err}");
+    // При старте через launchd (`--background`) тихо выходим, чтобы включение
+    // автозапуска из настроек не открывало лишнее окно.
+    let Some(_pid_guard) = PidGuard::acquire(&pid_path)? else {
+        if !background {
+            if let Err(err) = ui::spawn_settings_window() {
+                eprintln!("desktop_cleaner: не удалось открыть настройки: {err}");
+            }
         }
         return Ok(());
-    }
+    };
 
-    let _pid_guard = PidGuard::new(&pid_path)?;
+    let config_existed = config_path.exists();
+    let mut startup_config =
+        desktop_cleaner::config::Config::load_from(&config_path).unwrap_or_default();
 
-    let startup_config = desktop_cleaner::config::Config::load_from(&config_path).unwrap_or_default();
-    if startup_config.launch_at_login {
-        if let Err(err) = desktop_cleaner::config::sync_launch_agent(true) {
-            eprintln!("desktop_cleaner: не удалось синхронизировать LaunchAgent: {err}");
+    if !config_existed {
+        // Первый запуск: ставим агент, если так настроено по умолчанию.
+        if startup_config.launch_at_login {
+            if let Err(err) = desktop_cleaner::config::sync_launch_agent(true) {
+                eprintln!("desktop_cleaner: не удалось установить LaunchAgent: {err}");
+            }
+        }
+    } else if let Some(actual) = desktop_cleaner::config::launch_agent_status() {
+        // Состояние галочки должно совпадать с реальным положением в системе:
+        // пользователь мог изменить автозапуск через Системные настройки.
+        if actual != startup_config.launch_at_login {
+            startup_config.launch_at_login = actual;
+            if let Err(err) = startup_config.save_to(&config_path) {
+                eprintln!("desktop_cleaner: не удалось сохранить статус автозапуска: {err}");
+            }
         }
     }
 
@@ -106,15 +125,36 @@ fn another_instance_running(pid_path: &Path) -> bool {
         return false;
     };
 
-    if pid == std::process::id() {
+    if pid == std::process::id() || !process_alive(pid) {
         return false;
     }
 
+    // PID мог быть переиспользован другим процессом — не блокируем запуск.
+    process_is_desktop_cleaner(pid)
+}
+
+fn process_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn process_is_desktop_cleaner(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let comm = String::from_utf8_lossy(&output.stdout);
+            let comm = comm.trim();
+            comm.contains("desktop_cleaner") || comm.contains("Desktop Cleaner")
+        }
+        // Если `ps` недоступен, лучше перестраховаться и не запускать второй watcher.
+        _ => true,
+    }
 }
 
 /// Удаляет PID-файл при выходе основного процесса.
@@ -124,16 +164,51 @@ struct PidGuard {
 }
 
 impl PidGuard {
-    fn new(path: &Path) -> io::Result<Self> {
-        let pid = std::process::id();
+    /// Атомарно занимает PID-файл. `Ok(None)` — уже работает другой экземпляр.
+    fn acquire(path: &Path) -> io::Result<Option<Self>> {
+        if another_instance_running(path) {
+            return Ok(None);
+        }
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, pid.to_string())?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            pid,
-        })
+
+        let pid = std::process::id();
+        for _ in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    if let Err(err) = file.write_all(pid.to_string().as_bytes()) {
+                        let _ = fs::remove_file(path);
+                        return Err(err);
+                    }
+                    return Ok(Some(Self {
+                        path: path.to_path_buf(),
+                        pid,
+                    }));
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    // Первый процесс мог только что создать файл и ещё не успеть
+                    // записать PID — даём ему несколько миллисекунд.
+                    for _ in 0..10 {
+                        if another_instance_running(path) {
+                            return Ok(None);
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+
+                    // Файл остался от упавшего процесса — забираем его себе.
+                    let _ = fs::remove_file(path);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(None)
     }
 }
 
