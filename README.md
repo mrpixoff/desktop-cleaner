@@ -18,7 +18,7 @@
 
 Most file organizers are heavy Electron apps that sit in your Dock and eat memory. Desktop Cleaner is a native Rust app (`egui` + `FSEvents`) built to stay small, predictable, and out of the way.
 
-- **Zero idle overhead:** Once you save your rules, the settings window closes and unloads from memory. Only a tiny background watcher (~5 MB RAM) remains active via macOS `FSEvents`.
+- **Zero idle overhead:** Once you save your rules, the settings window closes and unloads from memory. Only a tiny background watcher (~15 MB RAM) remains active via macOS `FSEvents`.
 - **Native Launch at Login:** Enable or disable autostart directly from Settings or the tray menu. The toggle is backed by a native macOS LaunchAgent and stays in sync with the real system state, including changes made in macOS System Settings.
 - **Smart rule priority:** Exceptions always win. Choose whether to clear everything, keep only folders, remove only screenshots (with full macOS Unicode NFD support), or target specific file extensions.
 - **Flexible scheduling:** Clean up immediately (with a short debounce after new files appear), every N minutes, or once a day at a set time.
@@ -69,7 +69,7 @@ MIT
 
 Большинство «очистителей рабочего стола» — тяжёлые Electron-приложения, которые висят в Dock и съедают сотни мегабайт памяти. Desktop Cleaner — нативное Rust-приложение (`egui` + `FSEvents`), которое остаётся лёгким и незаметным.
 
-- **Нулевые накладные расходы в фоне:** после сохранения настроек окно закрывается и выгружается из памяти. В фоне остаётся только маленький наблюдатель (~5 МБ ОЗУ) на macOS `FSEvents`.
+- **Нулевые накладные расходы в фоне:** после сохранения настроек окно закрывается и выгружается из памяти. В фоне остаётся только маленький наблюдатель (~15 МБ ОЗУ) на macOS `FSEvents`.
 - **Нативный автозапуск при входе в систему:** включайте и выключайте автозапуск прямо в настройках или из меню трея. Переключатель работает через нативный LaunchAgent macOS и синхронизируется с реальным состоянием системы, включая изменения в Системных настройках macOS.
 - **Умные приоритеты правил:** исключения всегда важнее. Можно убирать всё, оставлять только папки, переносить только скриншоты (с полной поддержкой Unicode NFD в macOS) или выбирать конкретные расширения файлов.
 - **Гибкое расписание:** уборка сразу после появления файлов (с коротким debounce), каждые N минут или ежедневно в заданное время.
